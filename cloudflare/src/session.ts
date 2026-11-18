@@ -2,7 +2,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { env } from 'cloudflare:workers';
 
-export interface Session { csrf: string; created: number; customer?: number; admin?: number; pending?: number; email?: string; flash?: [string,string][]; id: string; previousId?: string }
+export interface Session { csrf: string; created: number; customer?: number; admin?: number; pending?: number; email?: string; phoneTransaction?: string; phoneAutoStart?: boolean; flash?: [string,string][]; id: string; previousId?: string }
 const settings = env as unknown as Record<string,string> & {DB:D1Database};
 if (!settings.SESSION_SECRET || settings.SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET must contain at least 32 characters');
 const db=settings.DB;
@@ -42,4 +42,4 @@ export async function redirectWith(res: Response, path: string, message?: string
   await setSession(res, session);
   res.redirect(path);
 }
-export function resetIdentity(session: Session) {delete session.customer;delete session.admin;delete session.pending;delete session.email;session.previousId=session.id;session.id=randomToken();session.csrf=randomToken();session.created=Date.now();}
+export function resetIdentity(session: Session) {delete session.customer;delete session.admin;delete session.pending;delete session.email;delete session.phoneTransaction;delete session.phoneAutoStart;session.previousId=session.id;session.id=randomToken();session.csrf=randomToken();session.created=Date.now();}

@@ -15,16 +15,18 @@ function todayEgypt() {const p=new Intl.DateTimeFormat('en-CA',{timeZone:'Africa
 function validDate(d:string) {if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return false;const x=new Date(`${d}T00:00:00Z`);return !Number.isNaN(x.getTime()) && x.toISOString().slice(0,10)===d;}
 function proofType(bytes:Buffer):string|null {if(bytes.length>=8 && bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return 'image/png';if(bytes.length>=3 && bytes[0]===255 && bytes[1]===216 && bytes[2]===255) return 'image/jpeg';if(bytes.length>=12 && bytes.toString('ascii',0,4)==='RIFF' && bytes.toString('ascii',8,12)==='WEBP') return 'image/webp';return null;}
 function discountCode(value: unknown) {return String(value||'').trim().toUpperCase();}
-async function findDiscount(code:string) {return code?db.prepare('SELECT code,percent FROM discount_codes WHERE code=? AND is_active=1').bind(code).first<{code:string;percent:number}>():null;}
+type Discount={code:string;percent:number;product_id:string|null;fixed_unit_price:number|null};
+async function findDiscount(code:string,id:string) {const value=code?await db.prepare('SELECT code,percent,product_id,fixed_unit_price FROM discount_codes WHERE code=? AND is_active=1').bind(code).first<Discount>():null;return value&&(!value.product_id||value.product_id===id)?value:null;}
+function discountFor(discount:Discount|null,unitPrice:number,quantity:number){const cents=Math.round(unitPrice*100)*quantity;const fixed=discount?.fixed_unit_price;const amount=fixed!=null?Math.max(0,cents-Math.round(Number(fixed)*100)*quantity):Math.round(cents*Number(discount?.percent||0)/100);return {subtotal:cents/100,discountAmount:amount/100,total:(cents-amount)/100,percent:fixed!=null?0:Number(discount?.percent||0),fixedUnitPrice:fixed==null?null:Math.min(unitPrice,Number(fixed))};}
 router.get('/customer/dashboard',guard('customer'),async(req,res,next)=>{try{const rows=await db.prepare('SELECT r.*, p.product_name, p.product_name_ar FROM reservations r JOIN products p ON p.product_id=r.product_id WHERE r.customer_ssn=? ORDER BY r.reservation_id DESC').bind((res.locals.session as Session).customer).all();await page(req,res,'customer/dashboard.html',{reservations:rows.results});}catch(e){next(e);}});
 router.get('/customer/reserve/:id',guard('customer'),async(req,res,next)=>{try{const product=await db.prepare("SELECT * FROM products WHERE product_id=? AND status='active'").bind(req.params.id).first<{product_id:string}>();if(!product){res.status(404).send('Product not found');return;}await page(req,res,'customer/reserve.html',{product,info:productInfo(product),product_id:req.params.id,today:todayEgypt(),instapay_account:settings.INSTAPAY_ACCOUNT||'mohamed.araby71@instapay'});}catch(e){next(e);}});
 router.post('/customer/reserve/:id/discount',guard('customer'),checkCsrf,async(req,res,next)=>{try{
  const id=String(req.params.id),code=discountCode(req.body.discount_code);if(code.length>40||(!code&&String(req.body.discount_code||'').trim())){res.status(400).json({valid:false});return;}
  const product=await db.prepare("SELECT unit_price FROM products WHERE product_id=? AND status='active'").bind(id).first<{unit_price:number}>();if(!product){res.status(404).json({valid:false});return;}
  const quantity=Number(req.body.quantity);if(!Number.isSafeInteger(quantity)||quantity<1||quantity>100000){res.status(400).json({valid:false});return;}
- const discount=await findDiscount(code);const subtotal=Math.round(Number(product.unit_price)*100)*quantity/100;
+ const discount=await findDiscount(code,id);const subtotal=Math.round(Number(product.unit_price)*100)*quantity/100;
  if(!discount){res.json({valid:false,subtotal});return;}
- const amount=Math.round(subtotal*Number(discount.percent))/100;res.json({valid:true,percent:Number(discount.percent),subtotal,discount_amount:amount,total:Math.round((subtotal-amount)*100)/100});
+ const calculation=discountFor(discount,Number(product.unit_price),quantity);res.json({valid:true,percent:calculation.percent,fixed_unit_price:calculation.fixedUnitPrice,subtotal,discount_amount:calculation.discountAmount,total:calculation.total});
 }catch(e){next(e);}});
 router.post('/customer/reserve/:id',guard('customer'),upload.single('payment_proof'),checkCsrf,async(req,res,next)=>{
  let stored='';
@@ -34,18 +36,18 @@ router.post('/customer/reserve/:id',guard('customer'),upload.single('payment_pro
   const product=await db.prepare("SELECT * FROM products WHERE product_id=? AND status='active'").bind(id).first<{product_name:string;unit_price:number}>();
   if(!product){res.status(404).send('Product not found');return;}
   if(code.length>40){await redirectWith(res,`/customer/reserve/${encodeURIComponent(id)}`,'Enter a valid discount code.','danger');return;}
-  const discount=await findDiscount(code);if(code&&!discount){await redirectWith(res,`/customer/reserve/${encodeURIComponent(id)}`,'This discount code is not valid.','danger');return;}
+  const discount=await findDiscount(code,id);if(code&&!discount){await redirectWith(res,`/customer/reserve/${encodeURIComponent(id)}`,'This discount code is not valid.','danger');return;}
   if(method==='instapay'){
     const type=req.file && proofType(req.file.buffer);if(!req.file||!type){await redirectWith(res,`/customer/reserve/${encodeURIComponent(id)}`,'Upload a valid PNG, JPEG or WEBP payment screenshot.','danger');return;}
     stored=`payment_proofs/${crypto.randomUUID()}`;
     await settings.PROOFS.put(stored,req.file.buffer,{httpMetadata:{contentType:type}});
   }
   const end=new Date(`${date}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+1);
-  const subtotal=Math.round(Number(product.unit_price)*100)*quantity/100,percent=Number(discount?.percent||0),discountAmount=Math.round(subtotal*percent)/100,total=Math.round((subtotal-discountAmount)*100)/100;
+  const {subtotal,percent,discountAmount,total}=discountFor(discount,Number(product.unit_price),quantity);
   const result=await db.prepare("INSERT INTO reservations(customer_ssn,product_id,reservation_date,pickup_date,collection_end_date,price,status,quantity,payment_method,payment_proof,payment_status,subtotal,discount_code,discount_percent,discount_amount) VALUES (?,?,CURRENT_TIMESTAMP,?,?,?,'active',?,?,?,?,?,?,?,?)").bind(session.customer,id,date,end.toISOString().slice(0,10),total,quantity,method,stored||null,method==='cash'?'cash_on_collection':'pending_verification',subtotal,discount?.code||null,percent,discountAmount).run();
   stored='';
   const account=await db.prepare('SELECT fname,lname,email,phone,city,address FROM customers WHERE SSN=?').bind(session.customer).first<Record<string,string>>();
-  const sent=await notify('New XPharma reservation',`Reservation: ${result.meta.last_row_id}\nCustomer: ${account?.fname} ${account?.lname}\nEmail: ${account?.email}\nPhone: ${account?.phone}\nCity: ${account?.city}\nAddress: ${account?.address}\nProduct: ${product.product_name} (${id})\nQuantity: ${quantity}\nCollection: ${date}\nPayment: ${method}\nSubtotal: EGP ${subtotal.toFixed(2)}\nDiscount: ${percent}%${discount?.code?` (${discount.code})`:''}\nTotal: EGP ${total.toFixed(2)}`);
+  const sent=await notify('New XPharma reservation',`Reservation: ${result.meta.last_row_id}\nCustomer: ${account?.fname} ${account?.lname}\nEmail: ${account?.email}\nPhone: ${account?.phone}\nCity: ${account?.city}\nAddress: ${account?.address}\nProduct: ${product.product_name} (${id})\nQuantity: ${quantity}\nCollection: ${date}\nPayment: ${method}\nSubtotal: EGP ${subtotal.toFixed(2)}\nDiscount: EGP ${discountAmount.toFixed(2)}${discount?.code?` (${discount.code})`:''}\nTotal: EGP ${total.toFixed(2)}`);
   await redirectWith(res,'/customer/dashboard',sent?'Reservation submitted successfully.':'Your reservation was saved, but the notification could not be sent. Please contact XPharma.',sent?'success':'warning');
  }catch(e){if(stored) await settings.PROOFS.delete(stored).catch(()=>{});next(e);}
 });
